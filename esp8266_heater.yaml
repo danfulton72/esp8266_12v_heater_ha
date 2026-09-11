@@ -1,0 +1,516 @@
+substitutions:
+  device_name: water_heater
+  friendly_name: Water Heater
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: "ESPHome replacement reconstructed from Bobil V1.2 ESP8266 firmware"
+  on_boot:
+    - priority: -100.0
+      then:
+        # Belt-and-braces safety: the GPIO switch also uses ALWAYS_OFF.
+        - switch.turn_off: heater_gpio
+        - script.execute: sample_inputs
+        - display.page.show: page_status
+        - component.update: oled
+
+esp8266:
+  board: d1_mini
+  restore_from_flash: true
+  # ESPHome recommends false where switches are involved; it also helps avoid
+  # transient GPIO changes during boot/update.
+  early_pin_init: false
+
+logger:
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Bobil Controller Fallback"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+# The original firmware uses the normal ESP8266 Wire defaults.  On a D1 Mini
+# those are GPIO4=D2 (SDA) and GPIO5=D1 (SCL).
+i2c:
+  sda: GPIO4
+  scl: GPIO5
+  frequency: 100kHz
+  scan: true
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 11
+  - file: "gfonts://Roboto@700"
+    id: font_large
+    size: 20
+
+# Non-persistent controller state.  Stage values:
+# 0=ready/off, 1=300 s qualification, 2=280-300 s verification load,
+# 3=heating, 4=temp sensor error, 5=low voltage, 6=config error,
+# 7=target reached.
+globals:
+  - id: qualify_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: qualify_started_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: controller_stage
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+switch:
+  # D6/GPIO12 selects which analogue source is connected to A0.
+  # LOW = thermistor; HIGH = battery-voltage divider.
+  - platform: gpio
+    id: adc_mux
+    pin: GPIO12
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  # D7/GPIO13 is the physical heater command.  The original firmware is
+  # ACTIVE HIGH.  Never expose this switch directly to Home Assistant.
+  - platform: gpio
+    id: heater_gpio
+    pin: GPIO13
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  # Equivalent to CURRENT ELEMENT / element enable in the original UI.
+  # Deliberately never restored ON after a reboot.
+  - platform: template
+    id: element_enable
+    name: "Element Routine"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    icon: mdi:radiator
+
+  # Flash backup contains mode=1, which decompilation proves means
+  # UNCONTROLLED VOLTAGE.  The state is restored, but Element Routine above
+  # still always boots OFF so a reboot cannot energise the heater by itself.
+  - platform: template
+    id: uncontrolled_voltage
+    name: "Uncontrolled Voltage"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    icon: mdi:battery-alert-variant-outline
+
+number:
+  - platform: template
+    id: target_temperature
+    name: "Tank Temperature Target"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    optimistic: true
+    restore_value: true
+    initial_value: 40
+    min_value: 20
+    max_value: 75
+    step: 5
+    mode: box
+
+  - platform: template
+    id: element_on_voltage
+    name: "Element On Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    optimistic: true
+    restore_value: true
+    initial_value: 13.4
+    min_value: 12.0
+    max_value: 15.0
+    step: 0.2
+    mode: box
+
+  - platform: template
+    id: element_off_voltage
+    name: "Element Off Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    optimistic: true
+    restore_value: true
+    initial_value: 12.2
+    min_value: 12.0
+    max_value: 15.0
+    step: 0.2
+    mode: box
+
+sensor:
+  # Values are published by sample_inputs.  A normal ESPHome ADC sensor cannot
+  # represent this hardware because the original design multiplexes A0.
+  - platform: template
+    id: tank_temperature
+    name: "Tank Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: battery_voltage
+    name: "Battery Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+
+  - platform: template
+    id: temp_adc_raw
+    name: "Temperature ADC Raw"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: never
+
+  - platform: template
+    id: battery_adc_raw
+    name: "Battery ADC Raw Average"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: never
+
+  - platform: template
+    id: qualification_countdown
+    name: "Element On Countdown"
+    unit_of_measurement: "s"
+    icon: mdi:timer-outline
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (!id(qualify_active))
+        return 0.0f;
+      const uint32_t elapsed = millis() - id(qualify_started_ms);
+      if (elapsed >= 300000UL)
+        return 0.0f;
+      return ceilf((300000.0f - elapsed) / 1000.0f);
+
+binary_sensor:
+  - platform: template
+    id: heating_element
+    name: "Heating Element"
+    icon: mdi:heat-wave
+    lambda: |-
+      return id(heater_gpio).state;
+
+  # Original menu/screen button: GPIO2 (D4), INPUT_PULLUP, active LOW.
+  - platform: gpio
+    id: menu_button
+    name: "Menu Button"
+    internal: true
+    pin:
+      number: GPIO2
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      - display.page.show_next: oled
+      - component.update: oled
+
+  # Original select/adjust button: GPIO0 (D3), INPUT_PULLUP, active LOW.
+  - platform: gpio
+    id: action_button
+    name: "Action Button"
+    internal: true
+    pin:
+      number: GPIO0
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      # Status page: toggle the same logical element-enable routine used by
+      # the original CURRENT ELEMENT screen.
+      - if:
+          condition:
+            display.is_displaying_page: page_status
+          then:
+            - switch.toggle: element_enable
+      - if:
+          condition:
+            display.is_displaying_page: page_target
+          then:
+            - number.set:
+                id: target_temperature
+                value: !lambda |-
+                  float v = id(target_temperature).state + 5.0f;
+                  return v > 75.0f ? 20.0f : v;
+      - if:
+          condition:
+            display.is_displaying_page: page_on_voltage
+          then:
+            - number.set:
+                id: element_on_voltage
+                value: !lambda |-
+                  float v = id(element_on_voltage).state + 0.2f;
+                  return v > 15.01f ? 12.0f : v;
+      - if:
+          condition:
+            display.is_displaying_page: page_off_voltage
+          then:
+            - number.set:
+                id: element_off_voltage
+                value: !lambda |-
+                  float v = id(element_off_voltage).state + 0.2f;
+                  return v > 15.01f ? 12.0f : v;
+      - if:
+          condition:
+            display.is_displaying_page: page_voltage_mode
+          then:
+            - switch.toggle: uncontrolled_voltage
+      - component.update: oled
+
+text_sensor:
+  - platform: template
+    id: controller_status
+    name: "Controller Status"
+    icon: mdi:state-machine
+    update_interval: 500ms
+    lambda: |-
+      if (!id(element_enable).state)
+        return {"ELEMENT OFF"};
+      switch (id(controller_stage)) {
+        case 1: return {"ON IN"};
+        case 2: return {"VERIFY"};
+        case 3: return {"HEATING"};
+        case 4: return {"SENSOR ERROR"};
+        case 5: return {"LOW VOLTAGE"};
+        case 6: return {"CONFIG ERROR"};
+        case 7: return {"TARGET REACHED"};
+        default:
+          if (id(uncontrolled_voltage).state)
+            return {"READY / UNCONTROLLED"};
+          return {"READY"};
+      }
+
+script:
+  # Recreates the V1.2 ADC timing/state machine:
+  #   +100 ms  D6 LOW
+  #   +700 ms  temperature conversion
+  #   +1200 ms D6 HIGH
+  #   +1800 ms battery conversion (100 samples)
+  #   +2500 ms cycle restarts
+  - id: sample_inputs
+    mode: restart
+    then:
+      - delay: 100ms
+      - switch.turn_off: adc_mux
+      - delay: 600ms
+      - lambda: |-
+          const int raw = analogRead(A0);
+          id(temp_adc_raw).publish_state((float) raw);
+
+          // Exact V1.2 conversion recovered from Xtensa code.
+          // The unusual -275.15 (rather than -273.15) is intentional: it is
+          // present in the original firmware and is retained for equivalence.
+          const double v = ((double) raw * (5.0 / 1023.0)) + 0.37;
+          if (!(v > 0.0 && v < 5.0)) {
+            id(tank_temperature).publish_state(NAN);
+          } else {
+            const double r_ntc = 10000.0 * v / (5.0 - v);
+            const double inv_t = (1.0 / 298.15) +
+                                 (log(r_ntc / 10000.0) / 3500.0);
+            const double temp_c = (1.0 / inv_t) - 275.15;
+            if (!std::isfinite(temp_c) || temp_c < -50.0 || temp_c > 125.0)
+              id(tank_temperature).publish_state(NAN);
+            else
+              id(tank_temperature).publish_state((float) temp_c);
+          }
+      - delay: 500ms
+      - switch.turn_on: adc_mux
+      - delay: 600ms
+      - lambda: |-
+          uint32_t sum = 0;
+          for (int i = 0; i < 100; i++)
+            sum += analogRead(A0);
+
+          const float avg = ((float) sum) / 100.0f;
+          id(battery_adc_raw).publish_state(avg);
+
+          // Exact V1.2 scaling: ADC * (5/1023) * 3.44.
+          const float volts = avg * (5.0f / 1023.0f) * 3.44f;
+          id(battery_voltage).publish_state(volts);
+
+# Fast control loop plus the original 2.5 s ADC cycle.
+interval:
+  - interval: 250ms
+    then:
+      - lambda: |-
+          const bool enabled = id(element_enable).state;
+          const bool uncontrolled = id(uncontrolled_voltage).state;
+          const float temp = id(tank_temperature).state;
+          const float volts = id(battery_voltage).state;
+          const float target = id(target_temperature).state;
+          const float on_v = id(element_on_voltage).state;
+          const float off_v = id(element_off_voltage).state;
+
+          auto stop_and_reset = [&](int stage) {
+            id(heater_gpio).turn_off();
+            id(qualify_active) = false;
+            id(qualify_started_ms) = 0;
+            id(controller_stage) = stage;
+          };
+
+          // Element routine is the master enable.  This deliberately wins over
+          // every other state, just as the original physical UI intended.
+          if (!enabled) {
+            stop_and_reset(0);
+            return;
+          }
+
+          // No trustworthy tank sensor => never heat.
+          if (!std::isfinite(temp)) {
+            stop_and_reset(4);
+            return;
+          }
+
+          // Upper edge of the original 5 C thermal hysteresis.
+          if (temp >= target) {
+            stop_and_reset(7);
+            return;
+          }
+
+          if (uncontrolled) {
+            // Firmware mode=1: bypass battery voltage gating/countdown, but
+            // retain the tank-temperature cutoff/hysteresis.
+            id(qualify_active) = false;
+            id(qualify_started_ms) = 0;
+
+            if (temp <= (target - 5.0f)) {
+              id(heater_gpio).turn_on();
+              id(controller_stage) = 3;
+            } else {
+              // In the 5 C hysteresis band retain the existing heater state.
+              id(controller_stage) = id(heater_gpio).state ? 3 : 0;
+            }
+            return;
+          }
+
+          // Controlled-voltage mode.  Reject an impossible threshold pair
+          // rather than allowing it to produce unsafe behaviour.
+          if (!(on_v > off_v)) {
+            stop_and_reset(6);
+            return;
+          }
+
+          if (!std::isfinite(volts)) {
+            stop_and_reset(5);
+            return;
+          }
+
+          // Lower threshold is the hard dropout/reset threshold.
+          if (volts <= off_v) {
+            stop_and_reset(5);
+            return;
+          }
+
+          // Once the 300 s qualification has completed, hysteresis is governed
+          // by OFF voltage and target temperature; ON voltage is only needed
+          // to begin a new qualification.
+          if (id(controller_stage) == 3 && id(heater_gpio).state) {
+            return;
+          }
+
+          if (id(qualify_active)) {
+            const uint32_t elapsed = millis() - id(qualify_started_ms);
+
+            // V1.2 has a 20 s load-verification phase: GPIO13 goes HIGH at
+            // 280 s, while the user-visible 300 s countdown continues.
+            if (elapsed >= 300000UL) {
+              id(heater_gpio).turn_on();
+              id(controller_stage) = 3;
+              id(qualify_active) = false;
+            } else if (elapsed >= 280000UL) {
+              id(heater_gpio).turn_on();
+              id(controller_stage) = 2;
+            } else {
+              id(heater_gpio).turn_off();
+              id(controller_stage) = 1;
+            }
+            return;
+          }
+
+          // Lower edge of the original 5 C thermal hysteresis plus the ON
+          // voltage threshold starts a new 300 s qualification.
+          if (temp <= (target - 5.0f) && volts >= on_v) {
+            id(qualify_active) = true;
+            id(qualify_started_ms) = millis();
+            id(heater_gpio).turn_off();
+            id(controller_stage) = 1;
+          } else {
+            id(heater_gpio).turn_off();
+            id(controller_stage) = 0;
+          }
+
+  - interval: 2.5s
+    then:
+      - script.execute: sample_inputs
+
+# The original firmware init sequence identifies this as a 128x64 SH1106 I2C display at 0x3C.
+display:
+  - platform: ssd1306_i2c
+    id: oled
+    model: "SH1106 128x64"
+    address: 0x3C
+    update_interval: 500ms
+    pages:
+      - id: page_status
+        lambda: |-
+          it.print(0, 0, id(font_small), "CURRENT ELEMENT");
+          it.printf(0, 14, id(font_large), "%s",
+                    id(heater_gpio).state ? "ON" : "OFF");
+          if (std::isfinite(id(tank_temperature).state))
+            it.printf(0, 38, id(font_small), "TEMP %.1fC", id(tank_temperature).state);
+          else
+            it.print(0, 38, id(font_small), "TEMP SENSOR ERROR");
+          if (std::isfinite(id(battery_voltage).state))
+            it.printf(0, 51, id(font_small), "V %.2f  %s",
+                      id(battery_voltage).state,
+                      id(uncontrolled_voltage).state ? "UNCTRL" : "CTRL");
+
+      - id: page_target
+        lambda: |-
+          it.print(0, 0, id(font_small), "TANK TEMP TARGET");
+          it.printf(0, 20, id(font_large), "%.0f C", id(target_temperature).state);
+          it.print(0, 51, id(font_small), "ACTION = +5 C");
+
+      - id: page_on_voltage
+        lambda: |-
+          it.print(0, 0, id(font_small), "ELEMENT ON VOLTAGE");
+          it.printf(0, 20, id(font_large), "%.1f V", id(element_on_voltage).state);
+          it.print(0, 51, id(font_small), "ACTION = +0.2 V");
+
+      - id: page_off_voltage
+        lambda: |-
+          it.print(0, 0, id(font_small), "ELEMENT OFF VOLTAGE");
+          it.printf(0, 20, id(font_large), "%.1f V", id(element_off_voltage).state);
+          it.print(0, 51, id(font_small), "ACTION = +0.2 V");
+
+      - id: page_voltage_mode
+        lambda: |-
+          it.print(0, 0, id(font_small), "VOLTAGE MODE");
+          it.printf(0, 20, id(font_large), "%s",
+                    id(uncontrolled_voltage).state ? "UNCONTROLLED" : "CONTROLLED");
+          it.print(0, 51, id(font_small), "ACTION = TOGGLE");
