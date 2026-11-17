@@ -1,6 +1,6 @@
 substitutions:
-  device_name: water_heater
-  friendly_name: Water Heater
+  device_name: henry-water-heater
+  friendly_name: Henry Water Heater
 
 esphome:
   name: ${device_name}
@@ -12,8 +12,13 @@ esphome:
         # Belt-and-braces safety: the GPIO switch also uses ALWAYS_OFF.
         - switch.turn_off: heater_gpio
         - script.execute: sample_inputs
+        # Branded startup splash, then fall through to the normal status page.
+        - display.page.show: page_splash
+        - component.update: oled
+        - delay: 2s
         - display.page.show: page_status
         - component.update: oled
+        - script.execute: screen_timeout
 
 esp8266:
   board: d1_mini
@@ -23,21 +28,28 @@ esp8266:
   early_pin_init: false
 
 logger:
+  level: WARN
 
 api:
 
 ota:
   - platform: esphome
-
+  - platform: web_server    
+    
 wifi:
-  ssid: !secret wifi_ssid
+  ssid: !secret henryvan_wifi_ssid
   password: !secret wifi_password
+  power_save_mode: NONE
   ap:
     ssid: "Bobil Controller Fallback"
-    password: !secret fallback_ap_password
+    password: "12345678"
 
 captive_portal:
 
+# Enable Web server.
+web_server:
+  port: 80
+  
 # The original firmware uses the normal ESP8266 Wire defaults.  On a D1 Mini
 # those are GPIO4=D2 (SDA) and GPIO5=D1 (SCL).
 i2c:
@@ -53,6 +65,12 @@ font:
   - file: "gfonts://Roboto@700"
     id: font_large
     size: 20
+
+image:
+  - platform: file
+    file: "henry_gerbil.png"
+    id: splash_logo
+    type: BINARY
 
 # Non-persistent controller state.  Stage values:
 # 0=ready/off, 1=300 s qualification, 2=280-300 s verification load,
@@ -71,8 +89,17 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  # Tracks whether the OLED panel is currently awake. This is runtime-only.
+  - id: display_awake
+    type: bool
+    restore_value: no
+    initial_value: 'true'
 
 switch:
+# enable a reboot button
+  - platform: restart
+    name: "Restart"
+  
   # D6/GPIO12 selects which analogue source is connected to A0.
   # LOW = thermistor; HIGH = battery-voltage divider.
   - platform: gpio
@@ -93,7 +120,7 @@ switch:
   # Deliberately never restored ON after a reboot.
   - platform: template
     id: element_enable
-    name: "Element Routine"
+    name: "Element Switch"
     optimistic: true
     restore_mode: ALWAYS_OFF
     icon: mdi:radiator
@@ -223,8 +250,16 @@ binary_sensor:
       - delayed_on: 20ms
       - delayed_off: 20ms
     on_press:
-      - display.page.show_next: oled
-      - component.update: oled
+      # If the OLED has timed out, the first press only wakes it.
+      - if:
+          condition:
+            lambda: 'return !id(display_awake);'
+          then:
+            - script.execute: wake_screen
+          else:
+            - display.page.show_next: oled
+            - component.update: oled
+            - script.execute: screen_timeout
 
   # Original select/adjust button: GPIO0 (D3), INPUT_PULLUP, active LOW.
   - platform: gpio
@@ -241,48 +276,74 @@ binary_sensor:
       - delayed_on: 20ms
       - delayed_off: 20ms
     on_press:
-      # Status page: toggle the same logical element-enable routine used by
-      # the original CURRENT ELEMENT screen.
+      # If the OLED has timed out, the first press only wakes it and does not
+      # toggle the heater or alter any setting.
       - if:
           condition:
-            display.is_displaying_page: page_status
+            lambda: 'return !id(display_awake);'
           then:
-            - switch.toggle: element_enable
-      - if:
-          condition:
-            display.is_displaying_page: page_target
-          then:
-            - number.set:
-                id: target_temperature
-                value: !lambda |-
-                  float v = id(target_temperature).state + 5.0f;
-                  return v > 75.0f ? 20.0f : v;
-      - if:
-          condition:
-            display.is_displaying_page: page_on_voltage
-          then:
-            - number.set:
-                id: element_on_voltage
-                value: !lambda |-
-                  float v = id(element_on_voltage).state + 0.2f;
-                  return v > 15.01f ? 12.0f : v;
-      - if:
-          condition:
-            display.is_displaying_page: page_off_voltage
-          then:
-            - number.set:
-                id: element_off_voltage
-                value: !lambda |-
-                  float v = id(element_off_voltage).state + 0.2f;
-                  return v > 15.01f ? 12.0f : v;
-      - if:
-          condition:
-            display.is_displaying_page: page_voltage_mode
-          then:
-            - switch.toggle: uncontrolled_voltage
-      - component.update: oled
+            - script.execute: wake_screen
+          else:
+            # Status page: toggle the same logical element-enable routine used by
+            # the original CURRENT ELEMENT screen.
+            - if:
+                condition:
+                  display.is_displaying_page: page_status
+                then:
+                  - switch.toggle: element_enable
+            - if:
+                condition:
+                  display.is_displaying_page: page_target
+                then:
+                  - number.set:
+                      id: target_temperature
+                      value: !lambda |-
+                        float v = id(target_temperature).state + 5.0f;
+                        return v > 75.0f ? 20.0f : v;
+            - if:
+                condition:
+                  display.is_displaying_page: page_on_voltage
+                then:
+                  - number.set:
+                      id: element_on_voltage
+                      value: !lambda |-
+                        float v = id(element_on_voltage).state + 0.2f;
+                        return v > 15.01f ? 12.0f : v;
+            - if:
+                condition:
+                  display.is_displaying_page: page_off_voltage
+                then:
+                  - number.set:
+                      id: element_off_voltage
+                      value: !lambda |-
+                        float v = id(element_off_voltage).state + 0.2f;
+                        return v > 15.01f ? 12.0f : v;
+            - if:
+                condition:
+                  display.is_displaying_page: page_voltage_mode
+                then:
+                  - switch.toggle: uncontrolled_voltage
+            - component.update: oled
+            - script.execute: screen_timeout
 
 text_sensor:
+  # Expose ESPHome version as sensor.
+  - platform: version
+    name: ESPHome Version
+
+  # Expose WiFi information as sensors.
+  - platform: wifi_info
+    ip_address:
+      name: IP
+    ssid:
+      name: SSID
+    bssid:
+      name: BSSID  
+
+  - platform: template
+    name: "Public IP"
+    id: public_ip
+    
   - platform: template
     id: controller_status
     name: "Controller Status"
@@ -306,6 +367,32 @@ text_sensor:
       }
 
 script:
+  # Wake the OLED with a short splash. The button press that calls this script
+  # is intentionally consumed, so it cannot toggle the heater or alter a setting.
+  - id: wake_screen
+    mode: restart
+    then:
+      - lambda: |-
+          id(oled).turn_on();
+          id(display_awake) = true;
+      - display.page.show: page_splash
+      - component.update: oled
+      - delay: 1s
+      - display.page.show: page_status
+      - component.update: oled
+      - script.execute: screen_timeout
+
+  # Sliding OLED inactivity timeout. Every physical button press restarts this
+  # script; after 60 seconds the SH1106 panel is switched off while the heater
+  # controller continues to run normally.
+  - id: screen_timeout
+    mode: restart
+    then:
+      - delay: 60s
+      - lambda: |-
+          id(oled).turn_off();
+          id(display_awake) = false;
+
   # Recreates the V1.2 ADC timing/state machine:
   #   +100 ms  D6 LOW
   #   +700 ms  temperature conversion
@@ -476,6 +563,10 @@ display:
     address: 0x3C
     update_interval: 500ms
     pages:
+      - id: page_splash
+        lambda: |-
+          it.image(3, 3, id(splash_logo));
+
       - id: page_status
         lambda: |-
           it.print(0, 0, id(font_small), "CURRENT ELEMENT");
