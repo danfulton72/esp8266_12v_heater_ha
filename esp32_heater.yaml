@@ -4,9 +4,27 @@ substitutions:
   # A0 voltage that the ESP8266 D1 Mini reported as 1023 (its on-board
   # 220k/100k divider gave ~3.2 V full scale).  Keeps the original maths valid.
   a0_full_scale: "3.2f"
-  # Calibration trim for the ESP32 ADC.  Leave at 1.0 initially; if the
-  # displayed battery voltage reads e.g. 2% low against a multimeter, set 1.02.
-  a0_gain: "1.0f"
+  # ESP32 -> ESP8266 A0 calibration.  The thermistor and battery signals come
+  # from different circuits on the heater board, so the ESP32 (which, unlike
+  # the ESP8266 D1 Mini, has no 220k/100k divider loading A0) sees a different
+  # error on each, and each gets its own correction.
+  #
+  # Temperature: quadratic fit through three ESP32/ESP8266 comparisons on the
+  # same tank (2026-11-18):
+  #   equivalent_volts = temp_cal_a*V^2 + temp_cal_b*V + temp_cal_c
+  #   ESP32 2.216 V vs ESP8266 1.995 V  ( 3.2 C)
+  #   ESP32 1.456 V vs ESP8266 1.226 V  (27.4 C)
+  #   ESP32 1.137 V vs ESP8266 0.873 V  (40.0 C)
+  # Above 40 C this is extrapolated; it reads slightly higher than a straight
+  # line would, which errs on the safe side (heater stops sooner).
+  temp_cal_a: "-0.08623f"
+  temp_cal_b: "1.32901f"
+  temp_cal_c: "-0.52635f"
+  # Battery: simple gain, from two consistent comparisons
+  # (ESP32 12.95 V vs ESP8266 13.24 V, and 12.93 V vs 13.21 V).
+  # To refine with a multimeter:
+  #   new value = current value * (meter volts / displayed volts)
+  battery_cal_gain: "1.023f"
   # Plausibility limits.  A floating or shorted A0 signal reads near 0 V, which
   # the original conversion turns into a valid-looking ~85-105 C.  Anything
   # above max_valid_temp_c is therefore treated as a sensor fault.
@@ -55,6 +73,17 @@ esp32_ble_tracker:
 
 bluetooth_proxy:
   active: true
+
+ble_advert_filter:
+  mac_allowlist:
+    - "4C:E1:74:68:A3:A8" # RTMShunt30032000674
+    - "CC:45:A5:AB:A6:2F" # RBC50D1S
+    - "CC:45:A5:8A:7B:70" # RIV1230PCH
+    - "E4:66:E5:F9:B2:76" # Sunster
+    - "D0:0C:5E:F9:EB:00" # Awning Sunster
+    - "F3:A9:C4:86:04:3C" # WaterFlowMeter
+    - "FA:EE:AE:BA:A0:F2" # Mopeka
+    - "ED:67:39:CD:8B:23" # AMPSFridge
 
 logger:
   level: WARN
@@ -457,7 +486,12 @@ script:
       - lambda: |-
           // Convert ESP32 volts back to the ESP8266 D1 Mini's 10-bit A0 scale
           // so the original V1.2 maths below stays byte-for-byte equivalent.
-          const float a0_v = id(a0_volts).sample() * ${a0_gain};
+          // Average 32 readings: the ESP32 ADC is noisier than the ESP8266's.
+          float sum_t = 0.0f;
+          for (int i = 0; i < 32; i++)
+            sum_t += id(a0_volts).sample();
+          const float v32 = sum_t / 32.0f;
+          const float a0_v = ${temp_cal_a} * v32 * v32 + ${temp_cal_b} * v32 + ${temp_cal_c};
           const int raw = (int) lroundf(a0_v * 1023.0f / ${a0_full_scale});
           id(temp_adc_raw).publish_state((float) raw);
 
@@ -465,7 +499,10 @@ script:
           // The unusual -275.15 (rather than -273.15) is intentional: it is
           // present in the original firmware and is retained for equivalence.
           const double v = ((double) raw * (5.0 / 1023.0)) + 0.37;
-          if (!(v > 0.0 && v < 5.0)) {
+          // The calibration curve flattens near the top of the ESP32 ADC range,
+          // so an open-circuit sensor (~3.0-3.1 V) would otherwise map to a
+          // plausible -30 C.  Anything above 2.8 V (about -17 C) is a fault.
+          if (v32 > 2.8f || !(v > 0.0 && v < 5.0)) {
             id(tank_temperature).publish_state(NAN);
           } else {
             const double r_ntc = 10000.0 * v / (5.0 - v);
@@ -489,7 +526,7 @@ script:
             sum_v += id(a0_volts).sample();
 
           // Average, then express on the ESP8266 10-bit A0 scale.
-          const float avg_v = (sum_v / 100.0f) * ${a0_gain};
+          const float avg_v = (sum_v / 100.0f) * ${battery_cal_gain};
           const float avg = avg_v * 1023.0f / ${a0_full_scale};
           id(battery_adc_raw).publish_state(avg);
 
