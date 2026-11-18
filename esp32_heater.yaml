@@ -71,7 +71,14 @@ esp32:
 esp32_ble_tracker:
   scan_parameters:
     active: true
-
+    
+external_components:
+  - source:
+      type: git
+      url: https://github.com/davidcoulson/esphome-ble-advert-filter
+      ref: v2.0.4
+    components: [ble_advert_filter]
+    
 bluetooth_proxy:
   active: true
 
