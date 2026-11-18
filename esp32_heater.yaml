@@ -1,12 +1,19 @@
 substitutions:
-  device_name: henry-water-heater
-  friendly_name: Henry Water Heater
+  device_name: henry-water-heater-esp32
+  friendly_name: Henry Water Heater ESP32
   # A0 voltage that the ESP8266 D1 Mini reported as 1023 (its on-board
   # 220k/100k divider gave ~3.2 V full scale).  Keeps the original maths valid.
   a0_full_scale: "3.2f"
   # Calibration trim for the ESP32 ADC.  Leave at 1.0 initially; if the
   # displayed battery voltage reads e.g. 2% low against a multimeter, set 1.02.
   a0_gain: "1.0f"
+  # Plausibility limits.  A floating or shorted A0 signal reads near 0 V, which
+  # the original conversion turns into a valid-looking ~85-105 C.  Anything
+  # above max_valid_temp_c is therefore treated as a sensor fault.
+  max_valid_temp_c: "80.0"
+  # A battery reading below this means the A0 signal path is missing (board not
+  # fitted, carrier fault or a floating input), not a real battery voltage.
+  min_signal_voltage: "8.0f"
 
 esphome:
   name: ${device_name}
@@ -37,7 +44,10 @@ esp32:
   board: wemos_d1_mini32
   framework:
     type: esp-idf
-
+    advanced:
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: true
+      
 # Bluetooth proxy for Home Assistant.
 esp32_ble_tracker:
   scan_parameters:
@@ -96,7 +106,7 @@ image:
 # Non-persistent controller state.  Stage values:
 # 0=ready/off, 1=300 s qualification, 2=280-300 s verification load,
 # 3=heating, 4=temp sensor error, 5=low voltage, 6=config error,
-# 7=target reached.
+# 7=target reached, 8=no A0 signal (battery reading implausibly low).
 globals:
   - id: qualify_active
     type: bool
@@ -398,6 +408,7 @@ text_sensor:
         case 5: return {"LOW VOLTAGE"};
         case 6: return {"CONFIG ERROR"};
         case 7: return {"TARGET REACHED"};
+        case 8: return {"NO SIGNAL"};
         default:
           if (id(uncontrolled_voltage).state)
             return {"READY / UNCONTROLLED"};
@@ -461,7 +472,10 @@ script:
             const double inv_t = (1.0 / 298.15) +
                                  (log(r_ntc / 10000.0) / 3500.0);
             const double temp_c = (1.0 / inv_t) - 275.15;
-            if (!std::isfinite(temp_c) || temp_c < -50.0 || temp_c > 125.0)
+            // Upper limit tightened from the original 125 C: readings above
+            // max_valid_temp_c come from a shorted/floating signal, not water.
+            if (!std::isfinite(temp_c) || temp_c < -50.0 ||
+                temp_c > ${max_valid_temp_c})
               id(tank_temperature).publish_state(NAN);
             else
               id(tank_temperature).publish_state((float) temp_c);
@@ -507,6 +521,13 @@ interval:
           // every other state, just as the original physical UI intended.
           if (!enabled) {
             stop_and_reset(0);
+            return;
+          }
+
+          // No plausible A0 signal at all => never heat.  Checked before the
+          // uncontrolled-voltage bypass so it applies in both modes.
+          if (!std::isfinite(volts) || volts < ${min_signal_voltage}) {
+            stop_and_reset(8);
             return;
           }
 
@@ -619,7 +640,10 @@ display:
             it.printf(0, 38, id(font_small), "TEMP %.1fC", id(tank_temperature).state);
           else
             it.print(0, 38, id(font_small), "TEMP SENSOR ERROR");
-          if (std::isfinite(id(battery_voltage).state))
+          if (!std::isfinite(id(battery_voltage).state) ||
+              id(battery_voltage).state < ${min_signal_voltage})
+            it.print(0, 51, id(font_small), "V NO SIGNAL");
+          else
             it.printf(0, 51, id(font_small), "V %.2f  %s",
                       id(battery_voltage).state,
                       id(uncontrolled_voltage).state ? "UNCTRL" : "CTRL");
