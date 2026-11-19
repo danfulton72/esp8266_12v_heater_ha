@@ -198,6 +198,19 @@ globals:
     type: float
     restore_value: no
     initial_value: 'NAN'
+  # EMA of the temperature, updated once per actual ADC publication.
+  - id: rise_filtered_temp
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: rise_processed_sample_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: rise_confirm_samples
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
   - id: rise_on_ms
     type: uint32_t
     restore_value: no
@@ -375,6 +388,16 @@ binary_sensor:
     icon: mdi:heat-wave
     lambda: |-
       return id(heater_gpio).state;
+
+  # Independent HA problem entity for the latched no-rise watchdog.
+  - platform: template
+    id: heating_fault_alarm
+    name: "Heating Fault"
+    device_class: problem
+    entity_category: diagnostic
+    icon: mdi:alert-circle
+    lambda: |-
+      return id(heating_fault);
 
   # Original menu/screen button: D4 (GPIO16 on ESP32 D1 Mini), INPUT_PULLUP,
   # active LOW.  No longer a boot-strapping pin, so presses at power-up are safe.
@@ -632,6 +655,9 @@ interval:
             // Switching the element off also clears a latched heating fault.
             id(heating_fault) = false;
             id(rise_baseline_temp) = NAN;
+            id(rise_filtered_temp) = NAN;
+            id(rise_processed_sample_ms) = 0;
+            id(rise_confirm_samples) = 0;
             id(rise_on_ms) = 0;
             id(rise_last_ms) = 0;
             stop_and_reset(0);
@@ -675,39 +701,66 @@ interval:
             return;
           }
 
-          // No-temperature-rise watchdog.  Accumulates element ON time and
-          // requires the tank to rise by min_temp_rise_c within
-          // no_rise_timeout_ms of it.  ON time adds up across heating periods
-          // until a rise is seen, so on/off cycling cannot hide a fault.  The
-          // baseline follows the water down while it cools, so a cool-down
-          // between periods does not count against the next one.  Every earlier
-          // early-return switches the element off, so time skipped by them is
-          // never counted as ON time.
+          // Upper edge of the original 5 C thermal hysteresis.
+          // Reaching target is success, not a no-temperature-rise fault.
+          // Reset rise history for the next heating cycle.
+          if (temp >= target) {
+            id(rise_baseline_temp) = NAN;
+            id(rise_filtered_temp) = NAN;
+            id(rise_processed_sample_ms) = 0;
+            id(rise_confirm_samples) = 0;
+            id(rise_on_ms) = 0;
+            id(rise_last_ms) = 0;
+            stop_and_reset(7);
+            return;
+          }
+
+          // No-temperature-rise watchdog: count cumulative commanded ON time.
+          // Use a smoothed temperature and confirm 3 consecutive fresh samples
+          // above baseline + min_temp_rise_c (not 3 repeats of one ADC value).
+          // The baseline only follows real cooling with the heater OFF; a
+          // 0.25 C deadband prevents small ADC dips ratcheting it down.
           {
             const uint32_t dt = id(rise_last_ms) == 0
                                     ? 0
                                     : (uint32_t)(now - id(rise_last_ms));
             id(rise_last_ms) = now;
-            if (!std::isfinite(id(rise_baseline_temp)) ||
-                temp < id(rise_baseline_temp))
-              id(rise_baseline_temp) = temp;
-            if (temp >= id(rise_baseline_temp) + ${min_temp_rise_c}) {
-              id(rise_baseline_temp) = temp;
-              id(rise_on_ms) = 0;
-            } else if (id(heater_gpio).state) {
+            if (id(heater_gpio).state)
               id(rise_on_ms) += dt;
+
+            // The fast control loop runs at 250 ms, ADC at ~2.5 s.
+            if (id(last_temp_update_ms) != id(rise_processed_sample_ms)) {
+              id(rise_processed_sample_ms) = id(last_temp_update_ms);
+              if (!std::isfinite(id(rise_filtered_temp)))
+                id(rise_filtered_temp) = temp;
+              else
+                id(rise_filtered_temp) =
+                    0.8f * id(rise_filtered_temp) + 0.2f * temp;
+
+              const float filtered = id(rise_filtered_temp);
+              if (!std::isfinite(id(rise_baseline_temp)))
+                id(rise_baseline_temp) = filtered;
+              if (!id(heater_gpio).state &&
+                  filtered < id(rise_baseline_temp) - 0.25f)
+                id(rise_baseline_temp) = filtered;
+
+              if (id(heater_gpio).state &&
+                  filtered >= id(rise_baseline_temp) + ${min_temp_rise_c}) {
+                if (++id(rise_confirm_samples) >= 3) {
+                  id(rise_baseline_temp) = filtered;
+                  id(rise_on_ms) = 0;
+                  id(rise_confirm_samples) = 0;
+                }
+              } else {
+                id(rise_confirm_samples) = 0;
+              }
             }
+
             if (id(rise_on_ms) > ${no_rise_timeout_ms}) {
               id(heating_fault) = true;
               stop_and_reset(10);
               return;
             }
-          }
-
-          // Upper edge of the original 5 C thermal hysteresis.
-          if (temp >= target) {
-            stop_and_reset(7);
-            return;
           }
 
           if (uncontrolled) {
@@ -822,8 +875,12 @@ display:
             it.printf(0, 38, id(font_small), "TEMP %.1fC", id(tank_temperature).state);
           else
             it.print(0, 38, id(font_small), "TEMP SENSOR ERROR");
-          if (!std::isfinite(id(battery_voltage).state) ||
-              id(battery_voltage).state < ${min_signal_voltage})
+          if (!id(battery_sample_seen))
+            it.print(0, 51, id(font_small), "V -- STARTING");
+          else if ((uint32_t)(now - id(last_battery_update_ms)) > ${max_sample_age_ms})
+            it.print(0, 51, id(font_small), "V -- STALE");
+          else if (!std::isfinite(id(battery_voltage).state) ||
+                   id(battery_voltage).state < ${min_signal_voltage})
             it.print(0, 51, id(font_small), "V NO SIGNAL");
           else
             it.printf(0, 51, id(font_small), "V %.2f  %s",
