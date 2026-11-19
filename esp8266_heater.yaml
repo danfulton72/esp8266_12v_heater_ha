@@ -75,7 +75,7 @@ image:
 # Non-persistent controller state.  Stage values:
 # 0=ready/off, 1=300 s qualification, 2=280-300 s verification load,
 # 3=heating, 4=temp sensor error, 5=low voltage, 6=config error,
-# 7=target reached.
+# 7=target reached, 9=sensor data stale.
 globals:
   - id: qualify_active
     type: bool
@@ -94,6 +94,23 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'true'
+  # Sensor freshness watchdog: runtime-only timestamps and startup flags.
+  - id: last_temp_update_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_battery_update_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: temp_sample_seen
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: battery_sample_seen
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 switch:
 # enable a reboot button
@@ -186,6 +203,11 @@ sensor:
     state_class: measurement
     accuracy_decimals: 1
     update_interval: never
+    on_raw_value:
+      then:
+        - lambda: |-
+            id(last_temp_update_ms) = millis();
+            id(temp_sample_seen) = true;
 
   - platform: template
     id: battery_voltage
@@ -195,6 +217,11 @@ sensor:
     state_class: measurement
     accuracy_decimals: 2
     update_interval: never
+    on_raw_value:
+      then:
+        - lambda: |-
+            id(last_battery_update_ms) = millis();
+            id(battery_sample_seen) = true;
 
   - platform: template
     id: temp_adc_raw
@@ -360,6 +387,7 @@ text_sensor:
         case 5: return {"LOW VOLTAGE"};
         case 6: return {"CONFIG ERROR"};
         case 7: return {"TARGET REACHED"};
+        case 9: return {"SENSOR STALE"};
         default:
           if (id(uncontrolled_voltage).state)
             return {"READY / UNCONTROLLED"};
@@ -464,6 +492,23 @@ interval:
           // every other state, just as the original physical UI intended.
           if (!enabled) {
             stop_and_reset(0);
+            return;
+          }
+
+          // Fail safe if either ADC source stops publishing samples.
+          // Allow slightly more than three nominal 2.5 s sampling cycles.
+          const uint32_t now = millis();
+          const uint32_t max_sample_age_ms = 8000UL;
+
+          const bool temp_stale =
+              !id(temp_sample_seen) ||
+              (uint32_t)(now - id(last_temp_update_ms)) > max_sample_age_ms;
+          const bool battery_stale =
+              !id(battery_sample_seen) ||
+              (uint32_t)(now - id(last_battery_update_ms)) > max_sample_age_ms;
+
+          if (temp_stale || battery_stale) {
+            stop_and_reset(9);
             return;
           }
 
