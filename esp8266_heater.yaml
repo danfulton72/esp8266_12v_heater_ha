@@ -1,6 +1,18 @@
 substitutions:
   device_name: henry-water-heater
   friendly_name: Henry Water Heater
+  # Sensor freshness watchdog: element is forced off if either ADC source has
+  # not published for this long (just over three 2.5 s sampling cycles).
+  max_sample_age_ms: "8000UL"
+  # No-temperature-rise watchdog: if the element accumulates this much ON time
+  # without the tank rising by at least min_temp_rise_c, latch HEATING FAULT
+  # (sensor out of its pocket, ADC mux fault, failed element...).  Cleared by
+  # switching the Element Switch off and on again, or by a reboot.
+  # Check a normal heat-up in Home Assistant history and tighten if you like:
+  # the timeout should comfortably exceed the time your element takes to
+  # raise a full tank by min_temp_rise_c.
+  no_rise_timeout_ms: "1800000UL"   # 30 minutes of element ON time
+  min_temp_rise_c: "1.0f"
 
 esphome:
   name: ${device_name}
@@ -75,7 +87,10 @@ image:
 # Non-persistent controller state.  Stage values:
 # 0=ready/off, 1=300 s qualification, 2=280-300 s verification load,
 # 3=heating, 4=temp sensor error, 5=low voltage, 6=config error,
-# 7=target reached, 9=sensor data stale.
+# 7=target reached, 9=sensor data stale (or STARTING before the first
+# samples), 10=heating fault (no temperature rise; latched).
+# Stage numbers are shared with esp32_heater.yaml, where 8 = no A0 signal;
+# 8 is unused here.
 globals:
   - id: qualify_active
     type: bool
@@ -108,6 +123,23 @@ globals:
     restore_value: no
     initial_value: 'false'
   - id: battery_sample_seen
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # No-temperature-rise watchdog: runtime-only.
+  - id: rise_baseline_temp
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: rise_on_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: rise_last_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: heating_fault
     type: bool
     restore_value: no
     initial_value: 'false'
@@ -387,7 +419,12 @@ text_sensor:
         case 5: return {"LOW VOLTAGE"};
         case 6: return {"CONFIG ERROR"};
         case 7: return {"TARGET REACHED"};
-        case 9: return {"SENSOR STALE"};
+        case 9:
+          // Before the first samples arrive this is normal start-up.
+          if (!id(temp_sample_seen) || !id(battery_sample_seen))
+            return {"STARTING"};
+          return {"SENSOR STALE"};
+        case 10: return {"HEATING FAULT"};
         default:
           if (id(uncontrolled_voltage).state)
             return {"READY / UNCONTROLLED"};
@@ -491,14 +528,26 @@ interval:
           // Element routine is the master enable.  This deliberately wins over
           // every other state, just as the original physical UI intended.
           if (!enabled) {
+            // Switching the element off also clears a latched heating fault.
+            id(heating_fault) = false;
+            id(rise_baseline_temp) = NAN;
+            id(rise_on_ms) = 0;
+            id(rise_last_ms) = 0;
             stop_and_reset(0);
+            return;
+          }
+
+          // Latched no-temperature-rise fault: stay off until the element is
+          // switched off and on again (or the device reboots).
+          if (id(heating_fault)) {
+            stop_and_reset(10);
             return;
           }
 
           // Fail safe if either ADC source stops publishing samples.
           // Allow slightly more than three nominal 2.5 s sampling cycles.
           const uint32_t now = millis();
-          const uint32_t max_sample_age_ms = 8000UL;
+          const uint32_t max_sample_age_ms = ${max_sample_age_ms};
 
           const bool temp_stale =
               !id(temp_sample_seen) ||
@@ -516,6 +565,35 @@ interval:
           if (!std::isfinite(temp)) {
             stop_and_reset(4);
             return;
+          }
+
+          // No-temperature-rise watchdog.  Accumulates element ON time and
+          // requires the tank to rise by min_temp_rise_c within
+          // no_rise_timeout_ms of it.  ON time adds up across heating periods
+          // until a rise is seen, so on/off cycling cannot hide a fault.  The
+          // baseline follows the water down while it cools, so a cool-down
+          // between periods does not count against the next one.  Every earlier
+          // early-return switches the element off, so time skipped by them is
+          // never counted as ON time.
+          {
+            const uint32_t dt = id(rise_last_ms) == 0
+                                    ? 0
+                                    : (uint32_t)(now - id(rise_last_ms));
+            id(rise_last_ms) = now;
+            if (!std::isfinite(id(rise_baseline_temp)) ||
+                temp < id(rise_baseline_temp))
+              id(rise_baseline_temp) = temp;
+            if (temp >= id(rise_baseline_temp) + ${min_temp_rise_c}) {
+              id(rise_baseline_temp) = temp;
+              id(rise_on_ms) = 0;
+            } else if (id(heater_gpio).state) {
+              id(rise_on_ms) += dt;
+            }
+            if (id(rise_on_ms) > ${no_rise_timeout_ms}) {
+              id(heating_fault) = true;
+              stop_and_reset(10);
+              return;
+            }
           }
 
           // Upper edge of the original 5 C thermal hysteresis.
@@ -617,7 +695,22 @@ display:
           it.print(0, 0, id(font_small), "CURRENT ELEMENT");
           it.printf(0, 14, id(font_large), "%s",
                     id(heater_gpio).state ? "ON" : "OFF");
-          if (std::isfinite(id(tank_temperature).state))
+          // Staleness is worked out here as well as in the control loop so the
+          // display flags it even while the element is switched off.
+          const uint32_t now = millis();
+          const bool starting =
+              !id(temp_sample_seen) || !id(battery_sample_seen);
+          const bool stale =
+              !starting &&
+              ((uint32_t)(now - id(last_temp_update_ms)) > ${max_sample_age_ms} ||
+               (uint32_t)(now - id(last_battery_update_ms)) > ${max_sample_age_ms});
+          if (id(heating_fault))
+            it.print(0, 38, id(font_small), "HEATING FAULT");
+          else if (starting)
+            it.print(0, 38, id(font_small), "STARTING...");
+          else if (stale)
+            it.print(0, 38, id(font_small), "SENSOR STALE");
+          else if (std::isfinite(id(tank_temperature).state))
             it.printf(0, 38, id(font_small), "TEMP %.1fC", id(tank_temperature).state);
           else
             it.print(0, 38, id(font_small), "TEMP SENSOR ERROR");
