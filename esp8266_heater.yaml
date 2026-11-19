@@ -610,8 +610,8 @@ interval:
           // No-temperature-rise watchdog: count cumulative commanded ON time.
           // Use a smoothed temperature and confirm 3 consecutive fresh samples
           // above baseline + min_temp_rise_c (not 3 repeats of one ADC value).
-          // The baseline only follows real cooling with the heater OFF; a
-          // 0.25 C deadband prevents small ADC dips ratcheting it down.
+          // The baseline follows real cooling (heater on or off); a 0.25 C
+          // deadband on the smoothed value stops ADC noise ratcheting it down.
           {
             const uint32_t dt = id(rise_last_ms) == 0
                                     ? 0
@@ -635,8 +635,10 @@ interval:
               const float filtered = id(rise_filtered_temp);
               if (!std::isfinite(id(rise_baseline_temp)))
                 id(rise_baseline_temp) = filtered;
-              if (!id(heater_gpio).state &&
-                  filtered < id(rise_baseline_temp) - 0.25f)
+              // Follow cooling in both heater states (deadband filters noise).
+              // Freezing the baseline while heating would false-trip whenever
+              // hot water is drawn during a heating period.
+              if (filtered < id(rise_baseline_temp) - 0.25f)
                 id(rise_baseline_temp) = filtered;
 
               if (id(heater_gpio).state &&
