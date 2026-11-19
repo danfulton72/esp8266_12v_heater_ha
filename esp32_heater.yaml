@@ -727,6 +727,9 @@ interval:
             id(rise_last_ms) = now;
             if (id(heater_gpio).state)
               id(rise_on_ms) += dt;
+            else
+              // A break in heating invalidates an incomplete rise confirmation.
+              id(rise_confirm_samples) = 0;
 
             // The fast control loop runs at 250 ms, ADC at ~2.5 s.
             if (id(last_temp_update_ms) != id(rise_processed_sample_ms)) {
